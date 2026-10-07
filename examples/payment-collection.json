@@ -1,0 +1,23 @@
+{
+  "to": "+15555550123",
+  "voice": {
+    "provider": "elevenlabs",
+    "voiceId": "YOUR_ELEVENLABS_VOICE_ID"
+  },
+  "task": {
+    "type": "payment_collection",
+    "recipientName": "Alex Example",
+    "organization": "Example Services",
+    "amountMinor": 25000,
+    "currency": "USD",
+    "reference": "INV-EXAMPLE-001",
+    "deadline": "2026-10-01",
+    "timezone": "America/Los_Angeles",
+    "maxReminders": 2
+  },
+  "authorization": {
+    "consentToCall": true,
+    "consentToTranscribe": true
+  },
+  "maxDurationSeconds": 600
+}

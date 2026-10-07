@@ -1,0 +1,43 @@
+{
+  "name": "yapper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Asynchronous, task-bound voice calls with Jev decisions and switchable speech providers.",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/cli.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/cli.js",
+    "test": "tsx --test test/*.test.ts",
+    "check": "tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@fastify/formbody": "^9.0.0",
+    "@fastify/rate-limit": "^11.2.0",
+    "@fastify/websocket": "^11.3.3",
+    "chrono-node": "^2.10.2",
+    "fastify": "^5.12.5",
+    "luxon": "^3.7.2",
+    "twilio": "^6.1.2",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/luxon": "^3.7.6",
+    "@types/node": "^24.19.1",
+    "@types/ws": "^8.18.2",
+    "eslint": "^9.39.5",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1"
+  }
+}
