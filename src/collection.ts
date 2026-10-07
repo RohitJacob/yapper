@@ -1,5 +1,15 @@
 import * as chrono from 'chrono-node';
 import { DateTime } from 'luxon';
+import { validateCallbackAt, type CallbackCandidate } from './callbacks.js';
+import {
+  callbackQuestion,
+  identityQuestion,
+  overdueReminder,
+  paymentQuestion,
+  phrase,
+  spokenCallback,
+  spokenDate,
+} from './responses.js';
 import type {
   CollectionState,
   CollectionTask,
@@ -29,6 +39,12 @@ export interface CollectionJudgments {
   dateChoice: string;
   dateConfidence: number;
   complete: number;
+  conversationControl:
+    'continue' | 'busy' | 'pause' | 'resume' | 'repeat' | 'brief';
+  controlConfidence: number;
+  callbackRequested: number;
+  callbackChoice: string;
+  callbackConfidence: number;
   raw: Record<string, unknown>;
 }
 
@@ -48,11 +64,17 @@ export function initialState(): CollectionState {
     offTopicCount: 0,
     informationComplete: false,
     lastDecision: null,
+    responseCounts: {},
+    concise: false,
+    paused: false,
+    awaitingCallbackTime: false,
+    pendingCallback: null,
+    requiresPaymentRefresh: false,
   };
 }
 
-export function opening(task: CollectionTask): string {
-  return `Hello. I'm an AI voice assistant, and this call is transcribed. Am I speaking with ${task.recipientName}?`;
+export function opening(task: CollectionTask, isCallback = false): string {
+  return `Hello. I'm an AI voice assistant, and this call is transcribed.${isCallback ? ' This is the callback you requested.' : ''} Am I speaking with ${task.recipientName}?`;
 }
 
 export function resultFor(
@@ -69,11 +91,24 @@ export function resultFor(
       state.promisedDate === null ? null : state.promisedDate > task.deadline,
     deadline: task.deadline,
     informationComplete: state.informationComplete,
-    needsHuman: reason !== 'information_complete',
+    needsHuman:
+      reason !== 'information_complete' && reason !== 'callback_requested',
     finishReason: reason,
     paymentEvidence: state.paymentEvidence,
     timelineEvidence: state.timelineEvidence,
     reminders: state.reminders,
+    callback:
+      reason === 'callback_requested' && state.pendingCallback
+        ? {
+            ...state.pendingCallback,
+            timezone: task.timezone,
+            deadlineStatus:
+              localDate(task, new Date(state.pendingCallback.evidence.at)) >
+              task.deadline
+                ? 'overdue'
+                : 'within_deadline',
+          }
+        : null,
   };
 }
 
@@ -132,12 +167,14 @@ export function applyJudgments(
   candidates: DateCandidate[],
   judgment: CollectionJudgments,
   now: Date,
+  callbacks: CallbackCandidate[] = [],
 ): TurnOutcome {
   const state: CollectionState = {
     ...previous,
     turns: previous.turns + 1,
     informationComplete: false,
     lastDecision: judgment.raw,
+    responseCounts: { ...previous.responseCounts },
   };
   if (judgment.optOut >= STOP) {
     return finish(
@@ -168,35 +205,110 @@ export function applyJudgments(
     );
   }
   if (state.turns >= MAX_TURNS) return humanHandoff(state);
-  if (!state.identityConfirmed) {
-    state.identityConfirmed = judgment.identity >= ACCEPT;
-    if (!state.identityConfirmed) {
-      return {
-        state,
-        text: `Before I discuss the reason for calling, please confirm: are you ${task.recipientName}?`,
-      };
-    }
+  state.identityConfirmed ||= judgment.identity >= ACCEPT;
+  const today = localDate(task, now);
+  if (state.identityConfirmed && judgment.offTopic < 0.7) {
+    updatePayment(state, recipient, judgment);
+    updateTimeline(state, recipient, candidates, judgment, today);
   }
+  state.informationComplete =
+    state.identityConfirmed &&
+    !state.requiresPaymentRefresh &&
+    judgment.complete >= ACCEPT &&
+    (state.paymentStatus === 'reported_paid' ||
+      (state.paymentStatus === 'unpaid' && state.promisedDate !== null));
+  const control =
+    judgment.controlConfidence >= 0.7
+      ? judgment.conversationControl
+      : 'continue';
+  if (control === 'brief') state.concise = true;
+  if (control === 'pause') {
+    state.paused = true;
+    return {
+      state,
+      text: previous.paused
+        ? ''
+        : phrase(state, 'pause', [
+            "Of course. I'll wait.",
+            'Take your time.',
+            "Sure, I'm here when you're ready.",
+          ]),
+    };
+  }
+  if (
+    previous.paused &&
+    control === 'continue' &&
+    judgment.paymentAddressed < 0.5 &&
+    judgment.timelineAddressed < 0.5 &&
+    judgment.callbackRequested < 0.5 &&
+    judgment.offTopic < 0.7
+  ) {
+    return { state, text: '' };
+  }
+  state.paused = false;
+  if (control === 'resume') {
+    state.pendingCallback = null;
+    state.awaitingCallbackTime = false;
+  }
+  if (
+    (control === 'repeat' || control === 'brief') &&
+    state.awaitingCallbackTime &&
+    judgment.offTopic < 0.7
+  ) {
+    if (state.pendingCallback)
+      return finish(
+        state,
+        'callback_requested',
+        `${callbackReminder(task, state, now)}${phrase(state, 'callback_repeat', [`Your requested callback is ${spokenCallback(state.pendingCallback.at, task.timezone)}. Goodbye.`, `The callback time you gave is ${spokenCallback(state.pendingCallback.at, task.timezone)}. Goodbye.`])}`,
+      );
+    return {
+      state,
+      text: `${callbackReminder(task, state, now)}${callbackQuestion(state)}`,
+    };
+  }
+  if (
+    state.pendingCallback &&
+    /^(?:(?:ok(?:ay)?|yes|sure|thanks|thank you|got it)[,!.\s]*)+$/i.test(
+      recipient.text,
+    )
+  )
+    return finish(
+      state,
+      'callback_requested',
+      phrase(state, 'callback_thanks', [
+        "You're welcome. Goodbye.",
+        'Thank you. Goodbye.',
+      ]),
+    );
+  const callbackContext =
+    control !== 'resume' &&
+    (control === 'busy' ||
+      judgment.callbackRequested >= ACCEPT ||
+      (state.awaitingCallbackTime &&
+        judgment.paymentAddressed < 0.5 &&
+        judgment.timelineAddressed < 0.5));
+  if (callbackContext && judgment.offTopic < 0.7)
+    return callbackOutcome(task, state, recipient, callbacks, judgment, now);
+  state.pendingCallback = null;
+  state.awaitingCallbackTime = false;
+  if (!state.identityConfirmed)
+    return { state, text: identityQuestion(task, state) };
   if (judgment.offTopic >= 0.7) {
     state.offTopicCount += 1;
     if (state.offTopicCount >= 3) return humanHandoff(state);
     return {
       state,
-      text: `I can only discuss this payment with you. ${paymentQuestion(state)}`,
+      text: `${phrase(state, 'off_topic', ['I can only discuss this payment with you.', "Let's stay with the payment question.", 'I can help with the payment status and timing.'])} ${paymentQuestion(state)}`,
     };
   }
-  updatePayment(state, recipient, judgment);
-  const today = localDate(task, now);
-  updateTimeline(state, recipient, candidates, judgment, today);
-  state.informationComplete =
-    judgment.complete >= ACCEPT &&
-    (state.paymentStatus === 'reported_paid' ||
-      (state.paymentStatus === 'unpaid' && state.promisedDate !== null));
   if (state.paymentStatus === 'reported_paid' && state.informationComplete) {
     return finish(
       state,
       'information_complete',
-      'Thank you. I have recorded that you report the payment is already made. Your payment has not been independently verified. Goodbye.',
+      phrase(state, 'paid_complete', [
+        'Thank you. I have recorded that you report the payment is already made. Your payment has not been independently verified. Goodbye.',
+        'I have noted your report of full payment. It has not been independently verified. Thank you, goodbye.',
+      ]),
     );
   }
   if (state.paymentStatus === 'unpaid' && state.promisedDate) {
@@ -206,31 +318,98 @@ export function applyJudgments(
       state.reminders += 1;
       const explanation =
         today > task.deadline
-          ? "We're already late. The payment needs to be made today."
-          : `That proposed date is after the payment deadline of ${spokenDate(task.deadline)}. Please make the payment today.`;
+          ? overdueReminder(state)
+          : phrase(state, 'late_promise', [
+              `That proposed date is after the payment deadline of ${spokenDate(task.deadline)}. Please make the payment today.`,
+              `That falls after the payment deadline, ${spokenDate(task.deadline)}. Can you bring the payment forward to today?`,
+              `The payment deadline is ${spokenDate(task.deadline)}, before your proposed date. Payment is needed today.`,
+            ]);
       return {
         state,
-        text: `${explanation} Can you commit to paying today, ${spokenDate(today)}?`,
+        text: `${explanation} ${phrase(state, 'today_commitment', [`Can you commit to paying today, ${spokenDate(today)}?`, 'Will you be able to make the full payment today?', 'Can you confirm payment today?'])}`,
       };
     }
     if (state.informationComplete) {
-      const reminder = missesDeadline
-        ? "We're already late. The payment needs to be made today. "
-        : '';
+      const reminder = missesDeadline ? `${overdueReminder(state)} ` : '';
       return finish(
         state,
         'information_complete',
-        `${reminder}Thank you. I have recorded your commitment to pay on ${spokenDate(state.promisedDate)}. Goodbye.`,
+        `${reminder}${phrase(state, 'promise_complete', [`Thank you. I have recorded your commitment to pay on ${spokenDate(state.promisedDate)}. Goodbye.`, `Your commitment to pay on ${spokenDate(state.promisedDate)} is recorded. Thank you, goodbye.`])}`,
       );
     }
   }
-  if (!previous.identityConfirmed) {
+  if (
+    !previous.identityConfirmed &&
+    !state.requiresPaymentRefresh &&
+    !previous.paymentEvidence &&
+    !previous.timelineEvidence &&
+    !previous.responseCounts.introduction
+  ) {
     return {
       state,
-      text: `I'm calling on behalf of ${task.organization} about ${amount(task)}, reference ${task.reference}, due ${spokenDate(task.deadline)}. ${paymentQuestion(state)}`,
+      text: `${phrase(state, 'introduction', [`I'm calling on behalf of ${task.organization} about ${amount(task)}, reference ${task.reference}, due ${spokenDate(task.deadline)}.`])} ${paymentQuestion(state)}`,
     };
   }
+  if (state.requiresPaymentRefresh && today > task.deadline)
+    return {
+      state,
+      text: `${overdueReminder(state)} ${paymentQuestion(state)}`,
+    };
   return { state, text: paymentQuestion(state) };
+}
+
+function callbackOutcome(
+  task: CollectionTask,
+  state: CollectionState,
+  recipient: TranscriptEntry,
+  candidates: CallbackCandidate[],
+  judgment: CollectionJudgments,
+  now: Date,
+): TurnOutcome {
+  state.pendingCallback = null;
+  state.awaitingCallbackTime = true;
+  const selected =
+    judgment.callbackConfidence >= ACCEPT
+      ? candidates.find((candidate) => candidate.id === judgment.callbackChoice)
+      : undefined;
+  const validity = selected
+    ? validateCallbackAt(task, selected.at, now)
+    : 'invalid';
+  const reminder = callbackReminder(task, state, now);
+  if (selected && validity === 'valid') {
+    state.pendingCallback = {
+      at: selected.at,
+      evidence: { text: recipient.text, at: recipient.at },
+    };
+    return finish(
+      state,
+      'callback_requested',
+      `${reminder}${phrase(state, 'callback_agreed', [`I have recorded your requested callback for ${spokenCallback(selected.at, task.timezone)}. Goodbye.`, `Your callback request for ${spokenCallback(selected.at, task.timezone)} is noted. Thank you, goodbye.`, `I have noted ${spokenCallback(selected.at, task.timezone)} for the callback. Goodbye.`])}`,
+    );
+  }
+  const explanation =
+    validity === 'after_deadline'
+      ? state.identityConfirmed
+        ? `That is after the payment deadline. Please choose a callback no later than ${spokenDate(task.deadline)} in ${task.timezone}. `
+        : `Please choose a callback no later than ${spokenDate(task.deadline)} in ${task.timezone}. `
+      : validity === 'past'
+        ? 'That time has already passed. '
+        : '';
+  return { state, text: `${reminder}${explanation}${callbackQuestion(state)}` };
+}
+
+function callbackReminder(
+  task: CollectionTask,
+  state: CollectionState,
+  now: Date,
+): string {
+  const overdue =
+    state.identityConfirmed &&
+    state.paymentStatus !== 'reported_paid' &&
+    localDate(task, now) > task.deadline;
+  return overdue
+    ? `${overdueReminder(state)} A callback does not extend the payment deadline. `
+    : '';
 }
 
 function updatePayment(
@@ -243,6 +422,11 @@ function updatePayment(
     judgment.paymentAddressed >= ACCEPT &&
     judgment.paymentStatus !== 'unknown'
   ) {
+    if (state.requiresPaymentRefresh) {
+      state.promisedDate = null;
+      state.timelineEvidence = null;
+      state.requiresPaymentRefresh = false;
+    }
     const changed = state.paymentStatus !== judgment.paymentStatus;
     state.paymentStatus = judgment.paymentStatus;
     state.paymentEvidence = { text: recipient.text, at: recipient.at };
@@ -296,25 +480,15 @@ function amount(task: CollectionTask): string {
   return formatter.format(task.amountMinor / 10 ** digits);
 }
 
-function spokenDate(date: string): string {
-  return DateTime.fromISO(date, { zone: 'UTC' })
-    .setLocale('en-US')
-    .toFormat('MMMM d, yyyy');
-}
-
-function paymentQuestion(state: CollectionState): string {
-  if (state.paymentStatus === 'unpaid')
-    return 'What exact date can you commit to making the payment?';
-  if (state.paymentStatus === 'reported_paid')
-    return 'To confirm, are you saying you have already made this payment in full?';
-  return 'Have you already made this payment in full? If not, what exact date can you commit to paying?';
-}
-
 function finish(
   state: CollectionState,
   finishReason: FinishReason,
   text: string,
 ): TurnOutcome {
+  if (finishReason !== 'callback_requested') {
+    state.pendingCallback = null;
+    state.awaitingCallbackTime = false;
+  }
   return { state, text, finishReason };
 }
 

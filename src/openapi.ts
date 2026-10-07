@@ -31,6 +31,7 @@ const finishReasons = [
   'max_duration',
   'provider_error',
   'canceled',
+  'callback_requested',
   'restarted',
 ] satisfies FinishReason[];
 const identifier = { type: 'string', format: 'uuid' };
@@ -41,8 +42,21 @@ const runId = {
   name: 'id',
   in: 'path',
   required: true,
-  description: 'Run identifier returned by POST /v1/runs.',
+  description: 'Run identifier returned by a run creation endpoint.',
   schema: identifier,
+};
+const idempotencyKey = {
+  name: 'Idempotency-Key',
+  in: 'header',
+  required: true,
+  description:
+    'Unique request key. Reusing a key for a different request returns 409.',
+  schema: {
+    type: 'string',
+    minLength: 8,
+    maxLength: 128,
+    pattern: '^[a-zA-Z0-9._:-]+$',
+  },
 };
 const retryAfter = {
   description: 'Number of seconds to wait before another request.',
@@ -107,7 +121,7 @@ export function openapiDocument() {
         ),
         Conflict: jsonResponse(
           'Error',
-          'The idempotency key was used with different details, the destination is suppressed, or the requested turn conflicts with the run state.',
+          'The idempotency key belongs to another request, the destination is suppressed, or the requested action conflicts with the run state.',
         ),
         RequestTooLarge: jsonResponse(
           'Error',
@@ -162,21 +176,7 @@ export function openapiDocument() {
           summary: 'Queue one call',
           description:
             'Returns immediately after persisting the run. Reuse the same Idempotency-Key and details to retrieve the existing run without another call; an idempotent replay can describe an already terminal run. Poll statusUrl or resultUrl for progress. Live mode requires an allowlisted destination and a configured key for the selected speech provider.',
-          parameters: [
-            {
-              name: 'Idempotency-Key',
-              in: 'header',
-              required: true,
-              description:
-                'Unique request key. Reusing a key with different normalized request details returns 409.',
-              schema: {
-                type: 'string',
-                minLength: 8,
-                maxLength: 128,
-                pattern: '^[a-zA-Z0-9._:-]+$',
-              },
-            },
-          ],
+          parameters: [idempotencyKey],
           requestBody: {
             required: true,
             content: jsonContent(schemaReference('CreateRun')),
@@ -222,7 +222,7 @@ export function openapiDocument() {
           summary: 'Read status, transcript, state and result',
           parameters: [runId],
           description:
-            'Includes generated agent text and finalized recipient transcripts. An interrupted agent entry may not have been fully heard by the recipient.',
+            'Includes generated agent text, finalized recipient transcripts, and callback-chain links. Optional delivery metadata records the complete sentence prefix acknowledged by Twilio; it does not prove what the recipient heard.',
           responses: {
             ...runErrors,
             '200': jsonResponse('Run', 'Current durable run snapshot.'),
@@ -273,6 +273,58 @@ export function openapiDocument() {
           },
         },
       },
+      '/v1/runs/{id}/callback': {
+        post: {
+          operationId: 'createCallbackRun',
+          tags: ['Runs'],
+          summary: 'Queue an agreed callback when its time arrives',
+          parameters: [runId, idempotencyKey],
+          description:
+            'The parent must have completed with finishReason=callback_requested and an agreed callback, have no unresolved error, and have a confirmed callEndedAt if a carrier call exists. Inspect error and result.needsHuman before triggering a follow-up; authenticated carrier end confirmation can resolve hangup uncertainty. Before the agreed time, returns 409 with Retry-After. At or after that time, persists one linked child and returns immediately; repeated requests, including another unused key, return that child. Every successfully used key is reserved for this parent callback operation, including retrieval of an existing child; reusing it for root creation or another parent returns 409. The child keeps task, payment context and response history, resets identity, and requires fresh payment facts before completion. The external scheduler must enforce calling hours and attempt limits. Yapper has no callback timer. Suppression and mandatory stop outcomes prevent callbacks.',
+          requestBody: {
+            required: false,
+            content: jsonContent(schemaReference('CreateCallback')),
+          },
+          responses: {
+            ...runErrors,
+            ...requestErrors,
+            '202': {
+              ...jsonResponse(
+                'AcceptedRun',
+                'Callback run accepted, or the existing child returned.',
+              ),
+              headers: {
+                Location: {
+                  description: 'Relative URI for the callback run resource.',
+                  schema: { type: 'string', format: 'uri-reference' },
+                },
+              },
+            },
+            '403': jsonResponse(
+              'Error',
+              'Live destination is not in ALLOWED_NUMBERS.',
+            ),
+            '409': {
+              ...jsonResponse(
+                'Error',
+                'Callback time has not arrived, the parent is not eligible, the previous carrier call has not been confirmed ended, the parent has an unresolved error, the destination is suppressed, or the key belongs to another request. Retry-After is present only when the callback time has not arrived.',
+              ),
+              headers: { 'Retry-After': retryAfter },
+            },
+            '429': {
+              ...jsonResponse(
+                'Error',
+                'Callback creation request rate limit exceeded.',
+              ),
+              headers: { 'Retry-After': retryAfter },
+            },
+            '503': jsonResponse(
+              'Error',
+              'Queue is full or the selected speech provider is not configured.',
+            ),
+          },
+        },
+      },
       '/v1/runs/{id}/turns': {
         post: {
           operationId: 'submitSimulationTurn',
@@ -317,6 +369,7 @@ export function openapiDocument() {
 function responseSchemas(): Record<string, JsonSchema> {
   return {
     CreateRun: z.toJSONSchema(CreateRunSchema),
+    CreateCallback: objectSchema({}),
     RunStatus: { type: 'string', enum: runStatuses },
     PaymentStatus: {
       type: 'string',
@@ -332,6 +385,30 @@ function responseSchemas(): Record<string, JsonSchema> {
       },
       at: dateTime,
     }),
+    CallbackRequest: objectSchema({
+      at: {
+        ...dateTime,
+        description: 'Agreed future callback instant normalized to UTC.',
+      },
+      evidence: schemaReference('Evidence'),
+    }),
+    CallbackResult: objectSchema({
+      at: {
+        ...dateTime,
+        description: 'Agreed callback instant normalized to UTC.',
+      },
+      evidence: schemaReference('Evidence'),
+      timezone: {
+        type: 'string',
+        description: 'IANA timezone from the original task.',
+      },
+      deadlineStatus: {
+        type: 'string',
+        enum: ['overdue', 'within_deadline'],
+        description:
+          'Deadline status when the callback was accepted. Before the deadline passes, callback times cannot exceed its local end of day. An overdue callback never extends the payment deadline.',
+      },
+    }),
     TranscriptEntry: objectSchema(
       {
         role: { type: 'string', enum: ['agent', 'recipient'] },
@@ -341,6 +418,17 @@ function responseSchemas(): Record<string, JsonSchema> {
           type: 'boolean',
           description:
             'When true, agent speech was interrupted and may not have been fully played.',
+        },
+        deliveredText: {
+          type: 'string',
+          description:
+            'In live mode, complete sentence prefix acknowledged as played by Twilio. Excludes partially played sentences and is not proof of recipient attention. Simulation returns generated text without audio playback.',
+        },
+        delivery: {
+          type: 'string',
+          enum: ['pending', 'playing', 'played', 'interrupted'],
+          description:
+            'Playback state for generated agent speech. Simulation marks replies played without audio playback.',
         },
       },
       ['role', 'text', 'at'],
@@ -361,6 +449,21 @@ function responseSchemas(): Record<string, JsonSchema> {
         description:
           'Most recent decision metadata. Model-specific fields may change; rely on the typed state and result for application logic.',
       }),
+      responseCounts: {
+        type: 'object',
+        additionalProperties: count,
+        description:
+          'Response-family counts used to choose bounded phrase variants.',
+      },
+      concise: { type: 'boolean' },
+      paused: { type: 'boolean' },
+      awaitingCallbackTime: { type: 'boolean' },
+      pendingCallback: nullable(schemaReference('CallbackRequest')),
+      requiresPaymentRefresh: {
+        type: 'boolean',
+        description:
+          'A callback retains previous payment facts but requires new payment evidence before completion.',
+      },
     }),
     RunResult: objectSchema({
       schemaVersion: { type: 'integer', const: 1 },
@@ -378,12 +481,21 @@ function responseSchemas(): Record<string, JsonSchema> {
           'Whether promisedDate is later than deadline. Null when no payment date is known.',
       }),
       deadline: date,
-      informationComplete: { type: 'boolean' },
-      needsHuman: { type: 'boolean' },
+      informationComplete: {
+        type: 'boolean',
+        description:
+          'Whether payment facts are complete; an agreed callback can leave this false.',
+      },
+      needsHuman: {
+        type: 'boolean',
+        description:
+          'Whether a person should review or follow up. A callback_requested result with no unresolved call error is an actionable scheduler handoff and sets this false. Unconfirmed hangup sets this true; authenticated carrier end confirmation can resolve it. Inspect error before triggering a follow-up.',
+      },
       finishReason: schemaReference('FinishReason'),
       paymentEvidence: nullable(schemaReference('Evidence')),
       timelineEvidence: nullable(schemaReference('Evidence')),
       reminders: count,
+      callback: nullable(schemaReference('CallbackResult')),
     }),
     Run: objectSchema({
       id: identifier,
@@ -398,10 +510,27 @@ function responseSchemas(): Record<string, JsonSchema> {
         description:
           'Twilio call identifier, or null before association and for simulation runs.',
       }),
+      callEndedAt: nullable({
+        ...dateTime,
+        description:
+          'Timestamp of confirmed carrier-call termination. A carrier call without confirmation blocks callback creation.',
+      }),
       state: schemaReference('CollectionState'),
       transcript: { type: 'array', items: schemaReference('TranscriptEntry') },
       result: nullable(schemaReference('RunResult')),
       error: nullable({ type: 'string' }),
+      parentRunId: nullable({
+        ...identifier,
+        description: 'Preceding callback-chain run, or null for a root run.',
+      }),
+      rootRunId: {
+        ...identifier,
+        description: 'First run in this callback chain; id for a root run.',
+      },
+      callbackRunId: nullable({
+        ...identifier,
+        description: 'The one linked callback child, once created.',
+      }),
     }),
     AcceptedRun: objectSchema({
       id: identifier,

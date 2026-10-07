@@ -194,7 +194,10 @@ test('accepting today resolves an overdue negotiation and reports deadline excee
   );
   assert.equal(today.finishReason, 'information_complete');
   assert.equal(today.state.promisedDate, '2026-10-06');
-  assert.match(today.text, /already late/);
+  assert.match(
+    today.text,
+    /already (?:late|overdue)|past the payment deadline/,
+  );
   assert.equal(
     resultFor(task, today.state, today.finishReason!).exceedsDeadline,
     true,
@@ -365,7 +368,11 @@ interface FixtureQuestion {
 
 interface FixtureRequest {
   model: string;
-  state: { dateCandidates: Array<{ id: string; text: string; date: string }> };
+  state: {
+    dateCandidates: Array<{ id: string; text: string; date: string }>;
+    callbackCandidates: Array<{ id: string; text: string; at: string }>;
+    transcript: TranscriptEntry[];
+  };
   questions: Record<string, FixtureQuestion>;
 }
 
@@ -376,6 +383,7 @@ class JevFixture {
   status = 200;
   invalidResponse: unknown;
   overrides: Record<string, string | number> = {};
+  confidences: Record<string, number> = {};
 
   async listen(): Promise<string> {
     this.server.listen(0, '127.0.0.1');
@@ -403,14 +411,19 @@ class JevFixture {
     const answers: Record<string, unknown> = {};
     for (const [id, question] of Object.entries(this.request.questions)) {
       const choice =
-        this.overrides[id] ?? (id === 'payment_status' ? 'unknown' : 'none');
+        this.overrides[id] ??
+        (id === 'payment_status'
+          ? 'unknown'
+          : id === 'conversation_control'
+            ? 'continue'
+            : 'none');
       answers[id] =
         question.type === 'noul'
           ? { type: 'noul', noul: this.overrides[id] ?? 0 }
           : {
               type: 'choice',
               choice,
-              confidence: 0.99,
+              confidence: this.confidences[id] ?? 0.99,
               probabilities: Object.fromEntries(
                 Object.keys(question.criteria ?? {}).map((key) => [
                   key,
@@ -457,7 +470,7 @@ test('Jev HTTP integration sends one independent batch and consumes documented t
   assert.equal(answer.state.reminders, 1);
   assert.equal(fixture.authorization, 'Bearer local-test-key');
   assert.equal(fixture.request?.model, 'jev-latest');
-  assert.equal(Object.keys(fixture.request?.questions ?? {}).length, 10);
+  assert.equal(Object.keys(fixture.request?.questions ?? {}).length, 13);
   assert.deepEqual(fixture.request?.state.dateCandidates, [
     { id: 'date_0', text: 'tomorrow', date: '2026-10-07' },
   ]);
@@ -515,4 +528,241 @@ test('Jev uncertainty clears stale claims; completeness alone cannot bypass miss
   assert.equal(answer.state.paymentEvidence, null);
   assert.equal(answer.finishReason, undefined);
   assert.equal(answer.state.informationComplete, false);
+});
+
+test('Jev batches callback intent separately from payment and binds the selected time to exact recipient evidence', async (context) => {
+  const fixture = new JevFixture();
+  context.after(() => fixture.close());
+  fixture.overrides = {
+    conversation_control: 'busy',
+    callback_requested: 0.99,
+    callback_time: 'callback_0',
+    information_complete: 0.99,
+  };
+  const engine = new JevDecisionEngine({
+    apiKey: 'local-test-key',
+    baseUrl: await fixture.listen(),
+  });
+  const answer = await engine.respond(
+    { ...task, deadline: '2026-10-08' },
+    { ...confirmed(), paymentStatus: 'unpaid' },
+    recipient("I'm busy. Call me tomorrow at 3pm."),
+    now,
+  );
+  assert.equal(answer.finishReason, 'callback_requested');
+  assert.equal(answer.state.pendingCallback?.at, '2026-10-07T22:00:00.000Z');
+  assert.equal(
+    answer.state.pendingCallback?.evidence.text,
+    "I'm busy. Call me tomorrow at 3pm.",
+  );
+  assert.equal(answer.state.promisedDate, null);
+  assert.equal(answer.state.informationComplete, false);
+  assert.equal(fixture.request?.state.callbackCandidates[0]?.id, 'callback_0');
+  assert.deepEqual(
+    Object.keys(
+      fixture.request?.questions.conversation_control?.criteria ?? {},
+    ),
+    ['continue', 'busy', 'pause', 'resume', 'repeat', 'brief'],
+  );
+  fixture.confidences.callback_time = 0.6;
+  const unclear = await engine.respond(
+    task,
+    confirmed(),
+    recipient('Call me tomorrow at 3pm'),
+    now,
+  );
+  assert.equal(unclear.finishReason, undefined);
+  assert.equal(unclear.state.pendingCallback, null);
+});
+
+test('Jev receives only acknowledged delivered words for interrupted or pending agent speech', async (context) => {
+  const fixture = new JevFixture();
+  context.after(() => fixture.close());
+  const engine = new JevDecisionEngine({
+    apiKey: 'local-test-key',
+    baseUrl: await fixture.listen(),
+  });
+  await engine.respond(
+    task,
+    confirmed(),
+    [
+      {
+        role: 'agent',
+        text: 'Hello. Have you already paid?',
+        at: now.toISOString(),
+        interrupted: true,
+        deliveredText: 'Hello.',
+        delivery: 'interrupted',
+      },
+      {
+        role: 'agent',
+        text: 'You can pay tomorrow?',
+        at: now.toISOString(),
+        interrupted: true,
+      },
+      {
+        role: 'agent',
+        text: 'Unplayed words.',
+        at: now.toISOString(),
+        delivery: 'pending',
+      },
+      ...recipient('Yes'),
+    ],
+    now,
+  );
+  assert.deepEqual(
+    fixture.request?.state.transcript.slice(0, 3).map((entry) => entry.text),
+    ['Hello.', '', ''],
+  );
+});
+
+test('Jev callback revisions, timing enforcement and priority exits cannot leave a stale agreed time', async (context) => {
+  const fixture = new JevFixture();
+  context.after(() => fixture.close());
+  const engine = new JevDecisionEngine({
+    apiKey: 'local-test-key',
+    baseUrl: await fixture.listen(),
+  });
+  const futureTask = { ...task, deadline: '2026-10-08' };
+  fixture.overrides = { callback_requested: 0.99, callback_time: 'callback_0' };
+  const first = await engine.respond(
+    futureTask,
+    confirmed(),
+    recipient('Call me tomorrow at 3pm'),
+    now,
+  );
+  const revised = await engine.respond(
+    futureTask,
+    first.state,
+    recipient('Actually October 9 at 3pm'),
+    now,
+  );
+  assert.equal(revised.finishReason, undefined);
+  assert.equal(revised.state.pendingCallback, null);
+  assert.match(revised.text, /after the payment deadline/);
+  fixture.overrides = { callback_requested: 0.99, callback_time: 'none' };
+  const negated = await engine.respond(
+    futureTask,
+    first.state,
+    recipient('Not tomorrow at 3pm, I am uncertain'),
+    now,
+  );
+  assert.equal(negated.state.pendingCallback, null);
+  fixture.overrides = {
+    opt_out: 0.99,
+    callback_requested: 0.99,
+    callback_time: 'callback_0',
+  };
+  const stopped = await engine.respond(
+    futureTask,
+    first.state,
+    recipient('Stop calling. I said tomorrow at 3pm earlier.'),
+    now,
+  );
+  assert.equal(stopped.finishReason, 'opt_out');
+  assert.equal(stopped.state.pendingCallback, null);
+});
+
+test('Jev completeness cannot reuse a pre-callback payment report without fresh assertion', async (context) => {
+  const fixture = new JevFixture();
+  context.after(() => fixture.close());
+  const engine = new JevDecisionEngine({
+    apiKey: 'local-test-key',
+    baseUrl: await fixture.listen(),
+  });
+  fixture.overrides = { identity: 0.99, information_complete: 0.99 };
+  const prior: CollectionState = {
+    ...initialState(),
+    requiresPaymentRefresh: true,
+    paymentStatus: 'reported_paid',
+    paymentEvidence: { text: 'I paid already', at: now.toISOString() },
+    responseCounts: { introduction: 1 },
+  };
+  const answer = await engine.respond(task, prior, recipient('Yes'), now);
+  assert.equal(answer.state.identityConfirmed, true);
+  assert.equal(answer.state.informationComplete, false);
+  assert.equal(answer.finishReason, undefined);
+  assert.match(answer.text, /already late/);
+  assert.match(answer.text, /last call/);
+  fixture.overrides = {
+    information_complete: 0.99,
+    payment_addressed: 0.99,
+    payment_status: 'reported_paid',
+  };
+  const fresh = await engine.respond(
+    task,
+    answer.state,
+    recipient('Yes, I paid the full amount'),
+    now,
+  );
+  assert.equal(fresh.finishReason, 'information_complete');
+  assert.equal(fresh.state.requiresPaymentRefresh, false);
+  assert.equal(
+    fresh.state.paymentEvidence?.text,
+    'Yes, I paid the full amount',
+  );
+});
+
+test('Jev pause retains independent payment facts and resume cancels callback negotiation', async (context) => {
+  const fixture = new JevFixture();
+  context.after(() => fixture.close());
+  const engine = new JevDecisionEngine({
+    apiKey: 'local-test-key',
+    baseUrl: await fixture.listen(),
+  });
+  fixture.overrides = {
+    conversation_control: 'pause',
+    payment_addressed: 0.99,
+    payment_status: 'reported_paid',
+    information_complete: 0.99,
+  };
+  const paused = await engine.respond(
+    task,
+    confirmed(),
+    recipient('I already paid yesterday. Hold on a moment.'),
+    now,
+  );
+  assert.equal(paused.state.paused, true);
+  assert.equal(paused.state.paymentStatus, 'reported_paid');
+  assert.equal(
+    paused.state.paymentEvidence?.text,
+    'I already paid yesterday. Hold on a moment.',
+  );
+  assert.equal(paused.finishReason, undefined);
+  fixture.overrides = {
+    conversation_control: 'resume',
+    information_complete: 0.99,
+  };
+  const resumed = await engine.respond(
+    task,
+    paused.state,
+    recipient('Go ahead'),
+    now,
+  );
+  assert.equal(resumed.finishReason, 'information_complete');
+  fixture.overrides = {
+    conversation_control: 'busy',
+    callback_requested: 0.99,
+    callback_time: 'callback_0',
+  };
+  const callback = await engine.respond(
+    task,
+    confirmed(),
+    recipient('Call me tomorrow at 3pm'),
+    now,
+  );
+  fixture.overrides = {
+    conversation_control: 'resume',
+    callback_requested: 0.99,
+  };
+  const canceled = await engine.respond(
+    task,
+    callback.state,
+    recipient('Actually, no callback. I can talk now.'),
+    now,
+  );
+  assert.equal(canceled.state.pendingCallback, null);
+  assert.equal(canceled.state.awaitingCallbackTime, false);
+  assert.equal(canceled.finishReason, undefined);
+  assert.doesNotMatch(canceled.text, /callback/);
 });

@@ -11,10 +11,18 @@ An asynchronous voice-agent API for a bounded task: call a recipient, ask about 
 - Compares the promised date with the supplied deadline. A late promise triggers a request for payment today, subject to a configurable limit of one to three reminders, then human follow-up.
 - Uses Jev for small structured decisions and a bounded state machine to keep the conversation on task.
 - Stops for an opt-out, wrong recipient, or dispute.
-- Handles interruptions by canceling active speech and clearing queued telephone audio.
+- Handles interruptions during speech by canceling synthesis, clearing queued telephone audio, and tracking the sentence prefix confirmed as played.
+- Responds to requests to pause, resume, repeat, or be brief, with varied replies selected without another generation round trip.
+- Records agreed callback times when a recipient is busy. An external scheduler triggers the linked callback run; upcoming deadlines bound callback times, and overdue payments remain due today.
 - Persists runs, transcripts, evidence, and results in SQLite so callers can retrieve them after the HTTP request finishes.
 
 The result records **self-reported payment**, not verification against a bank or ledger. `paymentVerified` is always `false`. Conversational identity confirmation is not authentication. The API requires the caller to attest that they have permission to call and transcribe the recipient.
+
+## Callbacks
+
+When a recipient asks to speak later, the agent obtains an explicit callback time. While the payment deadline has not passed, that time must fall on or before the end of the deadline date in the recipient's timezone. Once the payment is overdue, the agent emphasizes that payment is already late and needed today; an agreed later callback does not extend the payment deadline.
+
+The call ends with `finishReason: "callback_requested"` and a timestamp in `result.callback`. Your scheduler waits until that time, applies your own calling hours and attempt limits, then submits `POST /v1/runs/RUN_ID/callback` with an `Idempotency-Key`. No body is needed; an empty JSON object is also accepted. The endpoint creates one linked run and returns immediately. The new call confirms identity and current payment status again. Yapper does not schedule or repeatedly dial callbacks itself. See [the callback contract](docs/api.md#trigger-an-agreed-callback).
 
 ## Run locally
 

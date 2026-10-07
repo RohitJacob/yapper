@@ -7,7 +7,12 @@ import twilio from 'twilio';
 import { z } from 'zod';
 import type { Config } from './config.js';
 import { CreateRunSchema, type DecisionEngine, type Run } from './contracts.js';
-import { RunStore, ConflictError, terminalStatuses } from './store.js';
+import {
+  RunStore,
+  ConflictError,
+  CallbackNotDueError,
+  terminalStatuses,
+} from './store.js';
 import { Runner } from './runner.js';
 import { TwilioDialer, type Dialer } from './providers/twilio.js';
 import {
@@ -50,6 +55,11 @@ export async function buildApp(config: Config, options: AppOptions = {}) {
   await app.register(rateLimit, { global: false });
 
   app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof CallbackNotDueError)
+      return reply
+        .code(409)
+        .header('Retry-After', String(error.retryAfter))
+        .send({ error: error.message });
     if (error instanceof ConflictError)
       return reply.code(409).send({ error: error.message });
     if (error instanceof z.ZodError)
@@ -131,6 +141,53 @@ export async function buildApp(config: Config, options: AppOptions = {}) {
         async (request, reply) => {
           const run = store.get(request.params.id);
           return run ?? reply.code(404).send({ error: 'Run not found' });
+        },
+      );
+      api.post<{ Params: { id: string } }>(
+        '/runs/:id/callback',
+        { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+        async (request, reply) => {
+          z.object({})
+            .strict()
+            .parse(request.body ?? {});
+          const key = z
+            .string()
+            .min(8)
+            .max(128)
+            .regex(/^[a-zA-Z0-9._:-]+$/)
+            .parse(request.headers['idempotency-key']);
+          const parent = store.get(request.params.id);
+          if (!parent) return reply.code(404).send({ error: 'Run not found' });
+          if (config.YAPPER_MODE === 'live') {
+            if (!config.allowedNumbers.includes(parent.request.to))
+              return reply
+                .code(403)
+                .send({ error: 'Destination is not in ALLOWED_NUMBERS' });
+            const speechKey =
+              parent.request.voice.provider === 'elevenlabs'
+                ? config.ELEVENLABS_API_KEY
+                : config.MINIMAX_API_KEY;
+            if (!speechKey)
+              return reply
+                .code(503)
+                .send({ error: 'Selected speech provider is not configured' });
+          }
+          if (
+            store.list(['queued']).length >= 1000 &&
+            !store.hasKey(key) &&
+            !parent.callbackRunId
+          )
+            return reply.code(503).send({ error: 'Queue is full' });
+          const { run } = store.createCallback(parent.id, key);
+          return reply
+            .code(202)
+            .header('Location', `/v1/runs/${run.id}`)
+            .send({
+              id: run.id,
+              status: run.status,
+              statusUrl: `/v1/runs/${run.id}`,
+              resultUrl: `/v1/runs/${run.id}/result`,
+            });
         },
       );
       api.get<{ Params: { id: string } }>(
@@ -224,6 +281,12 @@ export async function buildApp(config: Config, options: AppOptions = {}) {
         const body = twilioBody(request);
         const run = authorizeCall(store, request.params.id, body);
         if (!run) return reply.code(404).send({ error: 'Call not found' });
+        if (
+          ['completed', 'canceled', 'busy', 'failed', 'no-answer'].includes(
+            body.CallStatus ?? '',
+          )
+        )
+          runner.recordCallEnded(run.id);
         if (!terminalStatuses.has(run.status)) {
           if (['completed', 'canceled'].includes(body.CallStatus ?? ''))
             await runner.finish(run.id, 'call_ended', undefined, false);

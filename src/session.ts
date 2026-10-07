@@ -1,3 +1,4 @@
+import { EventEmitter, once } from 'node:events';
 import type { WebSocket } from 'ws';
 import { z } from 'zod';
 import { opening } from './collection.js';
@@ -46,6 +47,16 @@ export interface SessionOptions {
   onClosed: (id: string) => void;
 }
 
+interface PlaybackMark {
+  name: string;
+  generation: number;
+  deliveredText: string;
+  bytes: number;
+  final: boolean;
+  expiresAt: number;
+  reason?: FinishReason;
+}
+
 export class CallSession {
   private streamSid: string | null = null;
   private transcriber: Transcriber | null = null;
@@ -55,11 +66,9 @@ export class CallSession {
   private stoppingReason: FinishReason | null = null;
   private committedRecipientIndex = -1;
   private speakingIndex: number | null = null;
-  private pendingMark: {
-    name: string;
-    generation: number;
-    reason?: FinishReason;
-  } | null = null;
+  private readonly playbackEvents = new EventEmitter();
+  private readonly pendingMarks: PlaybackMark[] = [];
+  private queuedAudioBytes = 0;
   private playbackTimer: NodeJS.Timeout | null = null;
   private durationTimer: NodeJS.Timeout | null = null;
   private readonly startTimer: NodeJS.Timeout;
@@ -80,7 +89,10 @@ export class CallSession {
   }
 
   get stopReason(): FinishReason | null {
-    return this.stoppingReason;
+    if (this.stoppingReason) return this.stoppingReason;
+    return this.options.store.get(this.options.id)?.state.pendingCallback
+      ? 'callback_requested'
+      : null;
   }
 
   receive(raw: string): void {
@@ -114,15 +126,9 @@ export class CallSession {
       this.transcriber?.send(Buffer.from(parsed.data.media.payload, 'base64'));
     } else if (message.event === 'mark') {
       const name = (message.mark as { name?: unknown } | undefined)?.name;
-      const mark = this.pendingMark;
-      if (mark && name === mark.name && mark.generation === this.generation) {
-        this.pendingMark = null;
-        this.speakingIndex = null;
-        if (this.playbackTimer) clearTimeout(this.playbackTimer);
-        if (mark.reason) void this.finish(mark.reason);
-      }
+      this.acknowledgePlayback(name);
     } else if (message.event === 'stop') {
-      void this.finish(this.stoppingReason ?? 'call_ended');
+      void this.finish(this.stopReason ?? 'call_ended');
     }
   }
 
@@ -158,7 +164,10 @@ export class CallSession {
     this.durationTimer = setTimeout(() => {
       void this.finish('max_duration');
     }, run.request.maxDurationSeconds * 1000);
-    void this.speak(opening(run.request.task), this.generation).catch(() => {
+    void this.speak(
+      opening(run.request.task, Boolean(run.parentRunId)),
+      this.generation,
+    ).catch(() => {
       void this.fail('Speech provider failed');
     });
   }
@@ -168,20 +177,26 @@ export class CallSession {
     this.generation += 1;
     this.controller?.abort();
     this.controller = null;
-    this.pendingMark = null;
+    this.pendingMarks.length = 0;
+    this.queuedAudioBytes = 0;
     if (this.playbackTimer) clearTimeout(this.playbackTimer);
+    this.markInterrupted();
+    if (this.streamSid)
+      this.send({ event: 'clear', streamSid: this.streamSid });
+    if (this.stoppingReason) void this.finish(this.stoppingReason);
+  }
+
+  private markInterrupted(): void {
     if (this.speakingIndex !== null) {
       const run = this.options.store.get(this.options.id);
       const entry = run?.transcript[this.speakingIndex];
       if (run && entry && !terminalStatuses.has(run.status)) {
         entry.interrupted = true;
+        entry.delivery = 'interrupted';
         this.options.store.save(run);
       }
       this.speakingIndex = null;
     }
-    if (this.streamSid)
-      this.send({ event: 'clear', streamSid: this.streamSid });
-    if (this.stoppingReason) void this.finish(this.stoppingReason);
   }
 
   async respond(text: string): Promise<void> {
@@ -200,6 +215,14 @@ export class CallSession {
       text,
       at: new Date().toISOString(),
     });
+    const decisionState = run.state;
+    if (decisionState.pendingCallback) {
+      run.state = {
+        ...decisionState,
+        pendingCallback: null,
+        awaitingCallbackTime: true,
+      };
+    }
     this.options.store.save(run);
     const recipientIndex = run.transcript.length - 1;
     const pendingRecipients = run.transcript.filter(
@@ -220,7 +243,7 @@ export class CallSession {
     try {
       const outcome = await this.options.engine.respond(
         run.request.task,
-        run.state,
+        decisionState,
         decisionTranscript,
         new Date(),
         controller.signal,
@@ -240,7 +263,8 @@ export class CallSession {
         this.options.store.suppress(run.request.to);
       if (
         outcome.finishReason &&
-        outcome.finishReason !== 'information_complete'
+        outcome.finishReason !== 'information_complete' &&
+        outcome.finishReason !== 'callback_requested'
       )
         this.stoppingReason = outcome.finishReason;
       await this.speak(outcome.text, generation, outcome.finishReason);
@@ -260,37 +284,76 @@ export class CallSession {
     reason?: FinishReason,
   ): Promise<void> {
     if (this.closed || generation !== this.generation) return;
+    if (!text.trim()) {
+      if (reason) await this.finish(reason);
+      return;
+    }
     const run = this.options.store.get(this.options.id);
     if (!run || terminalStatuses.has(run.status)) return;
     const controller = new AbortController();
     this.controller = controller;
     this.speakingIndex = run.transcript.length;
-    run.transcript.push({ role: 'agent', text, at: new Date().toISOString() });
+    run.transcript.push({
+      role: 'agent',
+      text,
+      at: new Date().toISOString(),
+      deliveredText: '',
+      delivery: 'pending',
+    });
     this.options.store.save(run);
+    const sentences = Array.from(
+      new Intl.Segmenter('en', { granularity: 'sentence' }).segment(text),
+    );
+    if (!sentences.length || sentences.length > 32 || text.length > 8000)
+      throw new Error('Speech response exceeded text limit');
     let bytes = 0;
     try {
-      for await (const chunk of this.options.speech.synthesize(
-        text,
-        run.request.voice.voiceId,
-        controller.signal,
-      )) {
-        if (
-          this.closed ||
-          controller.signal.aborted ||
-          generation !== this.generation
-        )
-          return;
-        bytes += chunk.length;
-        if (
-          bytes > 8000 * 120 ||
-          this.options.socket.bufferedAmount > 1_000_000
-        )
-          throw new Error('Audio exceeded buffer limit');
-        this.send({
-          event: 'media',
-          streamSid: this.streamSid,
-          media: { payload: chunk.toString('base64') },
+      for (const [index, sentence] of sentences.entries()) {
+        while (this.pendingMarks.length >= 2)
+          await once(this.playbackEvents, 'acknowledged', {
+            signal: controller.signal,
+          });
+        if (!this.isCurrent(generation, controller)) return;
+        let sentenceBytes = 0;
+        for await (const chunk of this.options.speech.synthesize(
+          sentence.segment.trim(),
+          run.request.voice.voiceId,
+          controller.signal,
+        )) {
+          if (!this.isCurrent(generation, controller)) return;
+          if (!chunk.length) continue;
+          if (!bytes) this.markPlaying();
+          bytes += chunk.length;
+          sentenceBytes += chunk.length;
+          this.queuedAudioBytes += chunk.length;
+          if (
+            bytes > 8000 * 120 ||
+            this.options.socket.bufferedAmount > 1_000_000
+          )
+            throw new Error('Audio exceeded buffer limit');
+          this.send({
+            event: 'media',
+            streamSid: this.streamSid,
+            media: { payload: chunk.toString('base64') },
+          });
+        }
+        if (!this.isCurrent(generation, controller)) return;
+        if (!sentenceBytes)
+          throw new Error('Speech provider returned no audio');
+        const name = `turn-${generation}-${run.transcript.length}-${index}`;
+        this.pendingMarks.push({
+          name,
+          generation,
+          deliveredText: text
+            .slice(0, sentence.index + sentence.segment.length)
+            .trimEnd(),
+          bytes: sentenceBytes,
+          final: index === sentences.length - 1,
+          expiresAt: Date.now() + Math.ceil(this.queuedAudioBytes / 8) + 15_000,
+          reason,
         });
+        this.send({ event: 'mark', streamSid: this.streamSid, mark: { name } });
+        this.watchPlayback();
       }
     } catch (error) {
       if (
@@ -301,22 +364,58 @@ export class CallSession {
         return;
       throw error;
     }
-    if (
-      this.closed ||
-      generation !== this.generation ||
-      controller.signal.aborted
-    )
-      return;
-    if (!bytes) throw new Error('Speech provider returned no audio');
-    const name = `turn-${generation}-${run.transcript.length}`;
-    this.pendingMark = { name, generation, reason };
-    this.send({ event: 'mark', streamSid: this.streamSid, mark: { name } });
-    this.playbackTimer = setTimeout(
-      () => {
-        void this.fail('Playback acknowledgment timed out');
-      },
-      Math.ceil(bytes / 8) + 15_000,
+  }
+
+  private isCurrent(generation: number, controller: AbortController): boolean {
+    return (
+      !this.closed &&
+      generation === this.generation &&
+      !controller.signal.aborted
     );
+  }
+
+  private markPlaying(): void {
+    const run = this.options.store.get(this.options.id);
+    const entry =
+      this.speakingIndex === null ? null : run?.transcript[this.speakingIndex];
+    if (!run || !entry || terminalStatuses.has(run.status)) return;
+    entry.delivery = 'playing';
+    this.options.store.save(run);
+  }
+
+  private acknowledgePlayback(name: unknown): void {
+    const mark = this.pendingMarks[0];
+    if (!mark || name !== mark.name || mark.generation !== this.generation)
+      return;
+    this.pendingMarks.shift();
+    this.queuedAudioBytes -= mark.bytes;
+    const run = this.options.store.get(this.options.id);
+    const entry =
+      this.speakingIndex === null ? null : run?.transcript[this.speakingIndex];
+    if (run && entry && !terminalStatuses.has(run.status)) {
+      entry.deliveredText = mark.deliveredText;
+      entry.delivery = mark.final ? 'played' : 'playing';
+      this.options.store.save(run);
+    }
+    if (mark.final) this.speakingIndex = null;
+    this.watchPlayback();
+    this.playbackEvents.emit('acknowledged');
+    if (mark.final && mark.reason) void this.finish(mark.reason);
+  }
+
+  private watchPlayback(): void {
+    if (this.playbackTimer) clearTimeout(this.playbackTimer);
+    const mark = this.pendingMarks[0];
+    this.playbackTimer = mark
+      ? setTimeout(
+          this.playbackTimedOut.bind(this),
+          Math.max(1, mark.expiresAt - Date.now()),
+        )
+      : null;
+  }
+
+  private playbackTimedOut(): void {
+    void this.fail('Playback acknowledgment timed out');
   }
 
   private send(message: Record<string, unknown>): void {
@@ -340,18 +439,19 @@ export class CallSession {
 
   private closedByPeer(): void {
     if (this.closed) return;
+    const reason = this.stopReason ?? 'call_ended';
     this.close();
-    void this.options.onFinish(
-      this.options.id,
-      this.stoppingReason ?? 'call_ended',
-    );
+    void this.options.onFinish(this.options.id, reason);
   }
 
   close(): void {
     if (this.closed) return;
+    this.markInterrupted();
     this.closed = true;
     this.generation += 1;
     this.controller?.abort();
+    this.pendingMarks.length = 0;
+    this.queuedAudioBytes = 0;
     clearTimeout(this.startTimer);
     if (this.durationTimer) clearTimeout(this.durationTimer);
     if (this.playbackTimer) clearTimeout(this.playbackTimer);

@@ -6,10 +6,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import {
-  setImmediate as nextTick,
-  setTimeout as delay,
-} from 'node:timers/promises';
+import { setImmediate as nextTick } from 'node:timers/promises';
 import { test } from 'node:test';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { TranscriptionCallbacks } from '../src/contracts.js';
@@ -127,6 +124,22 @@ async function closeWebSocketServer(server: WebSocketServer): Promise<void> {
   for (const socket of server.clients) socket.terminate();
   server.close();
   await once(server, 'close');
+}
+
+async function flushWebSocket(socket: WebSocket): Promise<void> {
+  const pong = once(socket, 'pong', { signal: AbortSignal.timeout(3000) });
+  socket.ping();
+  await pong;
+}
+
+async function waitForControl(
+  socket: WebSocket,
+  controls: string[],
+  expected: string,
+): Promise<void> {
+  const signal = AbortSignal.timeout(3000);
+  while (!controls.includes(expected))
+    await once(socket, 'message', { signal });
 }
 
 function sendResult(
@@ -309,7 +322,8 @@ test('Deepgram sends buffered telephone audio and aggregates finals without dupl
   sendResult(socket, 'the invoice yesterday.', 1, 2, true, true);
   sendResult(socket, 'the invoice yesterday.', 1, 2, true, true);
   socket.send(JSON.stringify({ type: 'UtteranceEnd', last_word_end: 2.8 }));
-  await delay(60);
+  await flushWebSocket(socket);
+  await waitForControl(socket, controls, '{"type":"KeepAlive"}');
   assert.deepEqual(Buffer.concat(received), phoneAudio);
   assert.deepEqual(recorder.transcripts, ['I paid the invoice yesterday.']);
   assert.equal(recorder.speechStarts, 1);
@@ -320,17 +334,18 @@ test('Deepgram sends buffered telephone audio and aggregates finals without dupl
   sendResult(socket, 'The reference is ABC.', 4, 1, true, false);
   socket.send(JSON.stringify({ type: 'UtteranceEnd', last_word_end: 4.9 }));
   socket.send(JSON.stringify({ type: 'UtteranceEnd', last_word_end: 4.9 }));
-  await delay(20);
+  await flushWebSocket(socket);
   assert.deepEqual(recorder.transcripts, [
     'I paid the invoice yesterday.',
     'The reference is ABC.',
   ]);
   assert.equal(recorder.speechStarts, 2);
+  const disconnected = once(socket, 'close', {
+    signal: AbortSignal.timeout(3000),
+  });
   transcriber.close();
-  await delay(20);
-  const countAfterClose = controls.length;
-  await delay(50);
-  assert.equal(controls.length, countAfterClose);
+  await disconnected;
+  assert.ok(controls.includes('{"type":"CloseStream"}'));
   assert.equal(recorder.errors.length, 0);
 });
 
@@ -343,7 +358,6 @@ test('Deepgram rejects audio overflow and reports remote failure exactly once', 
     maxBufferedAudioBytes: 4,
   });
   buffered.send(phoneAudio);
-  await delay(10);
   assert.equal(overflow.errors.length, 1);
   assert.match(overflow.errors[0]?.message ?? '', /buffer exceeded/);
 
@@ -354,10 +368,13 @@ test('Deepgram rejects audio overflow and reports remote failure exactly once', 
   });
   t.after(transcriber.close.bind(transcriber));
   const [socket] = (await connected) as [WebSocket];
+  const disconnected = once(socket, 'close', {
+    signal: AbortSignal.timeout(3000),
+  });
   socket.send(
     JSON.stringify({ type: 'Error', description: 'provider failure' }),
   );
-  await delay(20);
+  await disconnected;
   assert.equal(recorder.errors.length, 1);
   assert.match(recorder.errors[0]?.message ?? '', /transcription error/);
 });

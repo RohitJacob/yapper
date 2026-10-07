@@ -51,16 +51,27 @@ export type FinishReason =
   | 'max_duration'
   | 'provider_error'
   | 'canceled'
+  | 'callback_requested'
   | 'restarted';
 export interface TranscriptEntry {
   role: 'agent' | 'recipient';
   text: string;
   at: string;
   interrupted?: boolean;
+  deliveredText?: string;
+  delivery?: 'pending' | 'playing' | 'played' | 'interrupted';
 }
 export interface Evidence {
   text: string;
   at: string;
+}
+export interface CallbackRequest {
+  at: string;
+  evidence: Evidence;
+}
+export interface CallbackResult extends CallbackRequest {
+  timezone: string;
+  deadlineStatus: 'overdue' | 'within_deadline';
 }
 export interface CollectionState {
   identityConfirmed: boolean;
@@ -73,6 +84,12 @@ export interface CollectionState {
   offTopicCount: number;
   informationComplete: boolean;
   lastDecision: Record<string, unknown> | null;
+  responseCounts: Record<string, number>;
+  concise: boolean;
+  paused: boolean;
+  awaitingCallbackTime: boolean;
+  pendingCallback: CallbackRequest | null;
+  requiresPaymentRefresh: boolean;
 }
 export interface RunResult {
   schemaVersion: 1;
@@ -87,6 +104,7 @@ export interface RunResult {
   paymentEvidence: Evidence | null;
   timelineEvidence: Evidence | null;
   reminders: number;
+  callback: CallbackResult | null;
 }
 export interface Run {
   id: string;
@@ -96,10 +114,14 @@ export interface Run {
   startedAt: string | null;
   updatedAt: string;
   callSid: string | null;
+  callEndedAt: string | null;
   state: CollectionState;
   transcript: TranscriptEntry[];
   result: RunResult | null;
   error: string | null;
+  parentRunId: string | null;
+  rootRunId: string;
+  callbackRunId: string | null;
 }
 export interface TurnOutcome {
   state: CollectionState;

@@ -59,8 +59,9 @@ export class Runner {
       if (this.config.YAPPER_MODE === 'simulation')
         run.transcript.push({
           role: 'agent',
-          text: opening(run.request.task),
+          text: opening(run.request.task, Boolean(run.parentRunId)),
           at: new Date().toISOString(),
+          delivery: 'played',
         });
       this.store.save(run);
       if (this.dialer) this.track(this.dial(run));
@@ -132,11 +133,14 @@ export class Runner {
       const current = this.store.get(id)!;
       if (terminalStatuses.has(current.status)) return current;
       current.state = outcome.state;
-      current.transcript.push({
-        role: 'agent',
-        text: outcome.text,
-        at: new Date().toISOString(),
-      });
+      if (outcome.text.trim())
+        current.transcript.push({
+          role: 'agent',
+          text: outcome.text,
+          at: new Date().toISOString(),
+          delivery: 'played',
+          deliveredText: outcome.text,
+        });
       this.store.save(current);
       if (outcome.finishReason) await this.finish(id, outcome.finishReason);
       return this.store.get(id)!;
@@ -176,18 +180,40 @@ export class Runner {
         : reason === 'provider_error' || reason === 'restarted'
           ? 'failed'
           : 'completed';
-    this.store.finish(id, reason, status, error ?? null);
     this.sessions.get(id)?.close();
+    this.store.finish(id, reason, status, error ?? null);
     if (hangup && run.callSid && this.dialer) {
       await this.hangup(id, run.callSid);
+    } else if (!this.dialer || !hangup) {
+      this.recordCallEnded(id);
     }
+  }
+
+  recordCallEnded(id: string): void {
+    const run = this.store.get(id);
+    if (!run || run.callEndedAt) return;
+    run.callEndedAt = new Date().toISOString();
+    if (
+      run.error ===
+      'Could not confirm call hangup; check the telephony provider'
+    ) {
+      run.error = null;
+      if (run.result)
+        run.result.needsHuman = ![
+          'information_complete',
+          'callback_requested',
+        ].includes(run.result.finishReason);
+    }
+    this.store.save(run);
   }
 
   private async hangup(id: string, callSid: string): Promise<void> {
     try {
       await this.dialer!.hangup(callSid);
+      this.recordCallEnded(id);
     } catch {
       const current = this.store.get(id)!;
+      if (current.callEndedAt) return;
       current.error =
         'Could not confirm call hangup; check the telephony provider';
       if (current.result) current.result.needsHuman = true;

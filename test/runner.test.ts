@@ -141,6 +141,23 @@ class RunnerHarness {
   }
 }
 
+test('a signed end notification wins over a later failed hangup response', async (context) => {
+  const harness = new RunnerHarness();
+  context.after(() => harness.close());
+  const run = harness.create();
+  harness.runner.tick();
+  await settle();
+  harness.markConnected(run.id);
+  harness.dialer.hangupGate = new DeferredDial();
+  harness.dialer.failHangup = true;
+  const finishing = harness.runner.finish(run.id, 'call_ended');
+  harness.runner.recordCallEnded(run.id);
+  harness.dialer.hangupGate.complete('ended');
+  await finishing;
+  assert.ok(harness.store.get(run.id)?.callEndedAt);
+  assert.equal(harness.store.get(run.id)?.error, null);
+});
+
 test('queued work survives a closed database and is dispatched exactly once after reopening', async (context) => {
   const harness = new RunnerHarness();
   context.after(() => harness.close());
